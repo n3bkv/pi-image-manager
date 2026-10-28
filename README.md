@@ -229,7 +229,7 @@ MIT (see [LICENSE](LICENSE)). RonR's `image-backup` is fetched and installed sep
 ## Support This Project
 If you find this useful, star ⭐ the repo! It helps others discover it.
 
-##More Info
+## More Info
 
 Blog: https://hamradiohacks.blogspot.com
 

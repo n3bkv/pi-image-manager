@@ -1,0 +1,19 @@
+name: Pi Image Manager checks
+on:
+  push:
+  pull_request:
+jobs:
+  linux-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Smoke tests (privileged helper fixtures)
+        run: sudo bash Tests/smoke-tests.sh
+  mac-build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile Mac SwiftUI application
+        env:
+          PIIM_NO_OPEN: '1'
+        run: bash MacApp/build-mac.sh

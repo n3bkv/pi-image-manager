@@ -1,0 +1,16 @@
+# Mac build output and operating system artifacts
+.DS_Store
+MacApp/build/
+.swiftpm/
+*.swiftdoc
+*.swiftmodule
+*.partial
+*.img
+*-recovery/
+# Secrets and per-user profiles
+*.env
+*.pem
+*.key
+profiles.json
+# tests
+__pycache__/

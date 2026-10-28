@@ -1,0 +1,14 @@
+[
+  {
+    "id": "example-pi",
+    "name": "Living Room Pi",
+    "host": "raspberrypi.local",
+    "user": "pi",
+    "folder": "/Users/yourname/PiBackups",
+    "journal": true,
+    "apt": true,
+    "userCache": false,
+    "downloads": false,
+    "customPaths": "/srv/media/recordings\n/home/pi/cloud-sync"
+  }
+]

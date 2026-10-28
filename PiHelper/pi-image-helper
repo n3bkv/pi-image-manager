@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+# Pi Image Manager v0.2.0: staged .img and streamed filesystem recovery archives.
+# Run only through the installed root-owned helper (sudo rule restricts path, not args).
+set -Eeuo pipefail
+umask 077
+export LC_ALL=C
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+STAGE=/mnt/pi-image-stage
+ENGINE=/usr/local/sbin/image-backup
+LOCK=/run/pi-image-manager.lock
+
+fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+usage() { fail 'Usage: pi-image-helper {status|list|create filename.img extraMB presetsCSV customPathsBase64|meta filename.img|send filename.img|remove filename.img|preview presetsCSV customPathsBase64|exclusions presetsCSV customPathsBase64|estimate-stream presetsCSV customPathsBase64|stream-root presetsCSV customPathsBase64|stream-boot|browse absoluteDirectory|layout}'; }
+prepare() {
+    [[ -d "$STAGE" && ! -L "$STAGE" ]] || fail "$STAGE is missing or unsafe; rerun installer"
+    [[ $(stat -c %u "$STAGE") == 0 ]] || fail 'Staging directory must be root-owned'
+    [[ $(stat -c %a "$STAGE") == 700 ]] || fail 'Staging directory must have permissions 700'
+    [[ -w "$STAGE" ]] || fail "No write access to $STAGE"
+}
+check_name() {
+    local n="${1:-}"
+    [[ ${#n} -le 120 && "$n" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*\.img$ && "$n" != *'..'* ]] || fail 'Invalid image filename'
+    FILE="$STAGE/$n"
+    [[ ! -L "$FILE" ]] || fail 'Image symlink not allowed'
+}
+existing() {
+    check_name "$1"
+    [[ -f "$FILE" && -s "$FILE" ]] || fail 'Staged image missing or empty'
+}
+root_used_mb() { df -Pm / | awk 'NR==2{print $3}'; }
+stage_free_mb() { df -Pm "$STAGE" | awk 'NR==2{print $4}'; }
+check_free() {
+    local extra="$1" used free require root_fs stage_fs
+    used="$(root_used_mb)"; free="$(stage_free_mb)"
+    # A cautious bound above RonR's normal initial (~120% of root used); 4 GiB
+    # additional reserve when staging on the Pi's root filesystem.
+    require=$(( (used * 3 + 1) / 2 + extra + 1024 ))
+    root_fs="$(stat -c %d /)"; stage_fs="$(stat -c %d "$STAGE")"
+    if [[ "$root_fs" == "$stage_fs" ]]; then
+        require=$(( require + 4096 ))
+    fi
+    (( free >= require )) || fail "Insufficient staging space: available ${free} MiB, require at least ${require} MiB. Use a separate SSD at $STAGE or free space before backing up."
+}
+verify_image() {
+    local img="$1" loop boot rootfs
+    printf 'Checking image filesystems (read-only)...\n' >&2
+    loop="$(losetup --find --show --partscan --read-only "$img")" || fail 'Unable to attach image'
+    ACTIVE_LOOP="$loop"
+    boot="${loop}p1"; rootfs="${loop}p2"
+    [[ -b "$boot" && -b "$rootfs" ]] || fail 'Image partitions are missing'
+    fsck.vfat -n "$boot" >&2 || fail 'Boot filesystem failed verification'
+    local root_type
+    root_type="$(blkid -o value -s TYPE "$rootfs")"
+    case "$root_type" in
+        ext2|ext3|ext4) e2fsck -f -n "$rootfs" >&2 || fail 'Root filesystem failed verification' ;;
+        f2fs) fsck.f2fs -n "$rootfs" >&2 || fail 'Root filesystem failed verification' ;;
+        *) fail "Unsupported root filesystem: $root_type" ;;
+    esac
+    losetup -d "$loop"
+    ACTIVE_LOOP=""
+}
+meta() {
+    local n="$1" size sha
+    existing "$n"
+    size="$(stat -c %s "$FILE")"
+    sha="$(sha256sum "$FILE" | awk '{print $1}')"
+    printf 'META|%s|%s|%s\n' "$n" "$size" "$sha"
+}
+# Exclusion settings are supplied in two argument-safe fields, never evaluated as shell code.
+# Each user path is a literal absolute path (no shell globs); sent as base64 newline text.
+# The shared list is used by preview, tar, and RonR rsync staging.
+EXCLUDES=()
+PRESETS=()
+ADD_PATHS=()
+normalize_exclusions() {
+    local csv="${1:-}" encoded="${2:--}" preset path decoded part existing dup
+    [[ ${#csv} -le 128 && ${#encoded} -le 32768 ]] || fail 'Exclusion settings too long'
+    EXCLUDES=(/dev /proc /sys /run /tmp /mnt /media /lost+found /var/swap)
+    PRESETS=()
+    ADD_PATHS=()
+    if [[ -n "$csv" && "$csv" != '-' ]]; then
+        local -a chosen
+        IFS=',' read -ra chosen <<< "$csv"
+        for preset in "${chosen[@]}"; do
+            case "$preset" in
+                journal) path=/var/log/journal ;;
+                apt) path=/var/cache/apt/archives ;;
+                usercache) path=/home/*/.cache ;;
+                downloads) path=/home/*/Downloads ;;
+                *) fail "Unsupported exclusion preset: $preset" ;;
+            esac
+            [[ ! " ${PRESETS[*]} " == *" $preset "* ]] || continue
+            PRESETS+=("$preset")
+            EXCLUDES+=("$path")
+        done
+    fi
+    if [[ "$encoded" != '-' && -n "$encoded" ]]; then
+        [[ "$encoded" =~ ^[A-Za-z0-9+/]*={0,2}$ ]] || fail 'Invalid base64 exclusion payload'
+        decoded="$(printf '%s' "$encoded" | base64 -d)" || fail 'Cannot decode exclusion paths'
+        while IFS= read -r path || [[ -n "$path" ]]; do
+            [[ -n "$path" ]] || continue
+            [[ "$path" == /* && "$path" != */ && ${#path} -le 512 ]] || fail 'Excluded directory must be an absolute path without trailing slash'
+            [[ "$path" != *$'\r'* && "$path" != *$'\t'* && "$path" != *'|'* && "$path" != *'*'* && "$path" != *'?'* && "$path" != *'['* ]] || fail "Invalid characters in excluded path: $path"
+            [[ "$path" != *'//'* && "$path" != */../* && "$path" != */./* && "$path" != */.. && "$path" != */. ]] || fail 'Path must not contain redundant or parent components'
+            case "$path" in
+                /|/boot|/boot/*|/etc|/etc/*|/usr|/usr/bin|/usr/bin/*|/usr/lib|/usr/lib/*|/usr/sbin|/usr/sbin/*|/usr/local/bin|/usr/local/bin/*|/usr/local/sbin|/usr/local/sbin/*|/usr/share|/bin|/bin/*|/sbin|/sbin/*|/lib|/lib/*|/lib64|/lib64/*|/var|/var/lib|/home|/root|/opt|/srv|/dev|/proc|/sys|/run|/mnt|/media|/tmp|/lost+found)
+                    fail "Protected system location may not be excluded: $path" ;;
+            esac
+            (( ${#ADD_PATHS[@]} < 48 )) || fail 'Maximum 48 custom exclusions'
+            ADD_PATHS+=("$path")
+            EXCLUDES+=("$path")
+        done <<< "$decoded"
+    fi
+    # The option array is intentionally plain strings. No eval or user-provided CLI switches.
+    local -a clean=()
+    for path in "${EXCLUDES[@]}"; do
+        dup=0
+        for existing in "${clean[@]}"; do
+            [[ "$existing" != "$path" ]] || { dup=1; break; }
+        done
+        (( dup )) || clean+=("$path")
+    done
+    EXCLUDES=("${clean[@]}")
+}
+# Entries beginning /home/* are predefined glob patterns only; the user's paths
+# above are not permitted to contain wildcard syntax.
+estimate_root() {
+    local -a opts=(--apparent-size --one-file-system --summarize --block-size=1)
+    local path
+    for path in "${EXCLUDES[@]}"; do opts+=("--exclude=$path"); done
+    du "${opts[@]}" / | awk '{print $1}'
+}
+report_exclusions() {
+    local path bytes status
+    for path in "${EXCLUDES[@]}"; do
+        # Preset wildcards are patterns, not real directories; measure after expansion.
+        bytes=0; status=missing
+        local -a matches=()
+        if [[ "$path" == '/home/*/'* ]]; then
+            local prefix="${path##*/}"
+            shopt -s nullglob
+            matches=(/home/*/"$prefix")
+            shopt -u nullglob
+        else
+            matches=("$path")
+        fi
+        local match current
+        for match in "${matches[@]}"; do
+            if [[ -e "$match" || -L "$match" ]]; then
+                status=present
+                current="$(du -sb -- "$match" 2>/dev/null | awk '{print $1}')" || current=0
+                [[ "$current" =~ ^[0-9]+$ ]] || current=0
+                bytes=$((bytes + current))
+            fi
+        done
+        printf 'EXCLUDE|%s|%s|%s\n' "$path" "$bytes" "$status"
+        case "$path" in
+            /var/lib/*|/opt/*|/home/*|/usr/share/*)
+                if [[ "$path" != '/home/*/'* ]]; then
+                    printf 'WARN|%s|Could contain application data; verify restore impact\n' "$path"
+                fi ;;
+        esac
+    done
+}
+validate_config_args() {
+    [[ $# -eq 2 ]] || usage
+    normalize_exclusions "$1" "$2"
+}
+
+ACTIVE_LOOP=""
+trap '[[ -z "${ACTIVE_LOOP:-}" ]] || losetup -d "$ACTIVE_LOOP" >/dev/null 2>&1 || true' EXIT
+[[ $(id -u) == 0 ]] || fail 'Root permission required; use sudo -n'
+prepare
+cmd="${1:-}"; shift || true
+case "$cmd" in
+    status)
+        [[ $# -eq 0 ]] || usage
+        [[ -x "$ENGINE" ]] || fail "Missing $ENGINE. Rerun installer."
+        printf 'STATUS|ready|%s|%s|%s|%s|0.2.0\n' "$(hostname)" "$(stage_free_mb)" "$(root_used_mb)" "$(findmnt -rn -T "$STAGE" -o SOURCE | head -n 1)"
+        ;;
+    list)
+        [[ $# -eq 0 ]] || usage
+        find "$STAGE" -mindepth 1 -maxdepth 1 -type f -name '*.img' -printf 'STAGED|%f|%s|%TY-%Tm-%Td %TH:%TM\n' | sort -r
+        ;;
+    create)
+        [[ $# -eq 4 ]] || usage
+        check_name "$1"
+        [[ ! -e "$FILE" ]] || fail 'An image with this filename already exists'
+        extra="${2:-0}"
+        [[ "$extra" =~ ^[0-9]{1,5}$ ]] || fail 'Extra MB must be 0 to 32768'
+        (( 10#$extra <= 32768 )) || fail 'Extra MB must be 0 to 32768'
+        normalize_exclusions "$3" "$4"
+        [[ -x "$ENGINE" ]] || fail "Missing $ENGINE"
+        exec 9>"$LOCK"
+        flock -n 9 || fail 'Another image operation is running'
+        check_free "$extra"
+        printf 'Creating live image in temporary Pi staging directory: %s\n' "$1"
+        printf 'The Pi will remain on. This is not an atomic snapshot.\n'
+        exclusion_file="$(mktemp /run/pi-image-rsync-excludes.XXXXXX)"
+        chmod 0600 "$exclusion_file"
+        printf '%s\n' "${EXCLUDES[@]}" > "$exclusion_file"
+        if ! "$ENGINE" --initial "$FILE,,$extra" --options "--exclude-from=$exclusion_file"; then
+            rm -f -- "$exclusion_file"
+            fail 'RonR image-backup failed; staged image retained for inspection'
+        fi
+        rm -f -- "$exclusion_file"
+        [[ -s "$FILE" ]] || fail 'Image creation finished without an image'
+        verify_image "$FILE"
+        printf 'STAGED_OK|%s|%s\n' "$1" "$(stat -c %s "$FILE")"
+        ;;
+    meta)
+        [[ $# -eq 1 ]] || usage
+        exec 9>"$LOCK"
+        flock -s 9
+        existing "$1"
+        verify_image "$FILE"
+        meta "$1"
+        ;;
+    send)
+        [[ $# -eq 1 ]] || usage
+        existing "$1"
+        exec 9>"$LOCK"
+        flock -s 9
+        # stdout is strictly binary and goes directly to the Mac through SSH.
+        # Nothing else may be emitted on stdout in this command.
+        exec cat -- "$FILE"
+        ;;
+    remove)
+        [[ $# -eq 1 ]] || usage
+        existing "$1"
+        exec 9>"$LOCK"
+        flock -n 9 || fail 'Another image operation is running'
+        rm -- "$FILE"
+        printf 'REMOVED|%s\n' "$1"
+        ;;
+    preview|estimate-stream)
+        validate_config_args "$@"
+        mountpoint -q /boot/firmware || fail 'Boot not mounted'
+        root_size="$(estimate_root)"
+        boot_size="$(du --apparent-size --one-file-system --summarize --block-size=1 /boot/firmware | awk '{print $1}')"
+        [[ "$root_size" =~ ^[0-9]+$ && "$boot_size" =~ ^[0-9]+$ ]] || fail 'Could not estimate filesystem sizes'
+        printf 'ESTIMATE|%s|%s\n' "$((root_size * 105 / 100 + 1048576))" "$((boot_size * 105 / 100 + 1048576))"
+        if [[ "$cmd" == preview ]]; then report_exclusions; fi
+        ;;
+    exclusions)
+        validate_config_args "$@"
+        printf '%s\n' "${EXCLUDES[@]}"
+        ;;
+    stream-root)
+        # stdout is *only* a gzip compressed GNU tar archive.
+        validate_config_args "$@"
+        excludes=(--no-wildcards --anchored)
+        path=''
+        for path in "${EXCLUDES[@]}"; do
+            if [[ "$path" == '/home/*/'* ]]; then
+                # Expand only known built-in per-user presets.
+                shopt -s nullglob
+                for matched in /home/*/"${path##*/}"; do
+                    excludes+=("--exclude=.$matched")
+                done
+                shopt -u nullglob
+            else
+                excludes+=("--exclude=.$path")
+            fi
+        done
+        set -o pipefail
+        tar --create --file=- --one-file-system --acls --xattrs --numeric-owner \
+            --checkpoint=512 --checkpoint-action='echo=PIIM_SOURCE|%u' \
+            "${excludes[@]}" -C / . | gzip -1 -c
+        ;;
+    stream-boot)
+        [[ $# -eq 0 ]] || usage
+        mountpoint -q /boot/firmware || fail '/boot/firmware is not mounted; refusing incomplete backup'
+        set -o pipefail
+        tar --create --file=- --one-file-system --acls --xattrs --numeric-owner \
+            --checkpoint=512 --checkpoint-action='echo=PIIM_SOURCE|%u' \
+            -C /boot/firmware . | gzip -1 -c
+        ;;
+    browse)
+        [[ $# -eq 1 ]] || usage
+        dir="$1"
+        [[ "$dir" == /* && "$dir" != *$'\n'* && "$dir" != *'|'* && ${#dir} -le 512 ]] || fail 'Invalid browse path'
+        # No sensitive configuration directories or private root-home through browser.
+        case "$dir" in
+            /|/home|/opt|/srv|/var|/usr/share|/mnt|/media|/home/*|/opt/*|/srv/*|/var/*|/usr/share/*|/mnt/*|/media/*) ;;
+            *) fail 'Browser is limited to home, application, media and data directories' ;;
+        esac
+        [[ -d "$dir" && ! -L "$dir" ]] || fail 'Directory missing or symbolic link'
+        # List names only, not file contents. Only world-readable directory entries.
+        printf 'CURRENT|%s\n' "$dir"
+        count=0
+        while IFS= read -r -d '' entry; do
+            [[ "$entry" != *$'\n'* && "$entry" != *$'\r'* && "$entry" != *'|'* ]] || continue
+            printf 'DIR|%s\n' "$entry"
+            count=$((count + 1))
+            (( count < 150 )) || break
+        done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d ! -type l -print0)
+        ;;
+    layout)
+        [[ $# -eq 0 ]] || usage
+        root_source="$(findmnt -rn -o SOURCE /)"
+        boot_source="$(findmnt -rn -o SOURCE /boot/firmware)"
+        [[ -b "$root_source" && -b "$boot_source" ]] || fail 'Expected block root/boot devices'
+        disk="$(lsblk -no PKNAME "$root_source" | head -1)"
+        [[ -n "$disk" && -b "/dev/$disk" ]] || fail 'Cannot detect boot disk'
+        echo '# Pi Image Manager v0.2.0 — recovery layout (not an image)'
+        echo "# source disk: /dev/$disk"
+        echo "# root: $root_source"
+        echo "# boot: $boot_source"
+        echo '# sfdisk partition layout:'
+        sfdisk --dump "/dev/$disk"
+        echo '# Mounted filesystems:'
+        findmnt -rn -o TARGET,SOURCE,FSTYPE -T /
+        findmnt -rn -o TARGET,SOURCE,FSTYPE -T /boot/firmware
+        echo "# root-fstype: $(findmnt -rn -o FSTYPE -T /)"
+        echo "# boot-fstype: $(findmnt -rn -o FSTYPE -T /boot/firmware)"
+        echo '# Filesystem labels and UUIDs:'
+        blkid "$root_source" "$boot_source"
+        ;;
+    *) usage ;;
+esac
